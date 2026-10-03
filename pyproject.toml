@@ -1,0 +1,8 @@
+[project]
+name = "pack-import"
+version = "0.1.0"
+description = "Verifying importer for Git PACK v2 files (pure Python, no git index-pack)"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
