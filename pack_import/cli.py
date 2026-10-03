@@ -24,7 +24,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_import = sub.add_parser("import", help="verify, stage and publish a pack")
-    p_import.add_argument("--tip", action="append", default=[])
+    p_import.add_argument(
+        "--tip",
+        action="append",
+        default=[],
+        metavar="OBJECT-ID",
+        help="commit (or annotated tag peeling to a commit) whose full "
+        "reachable object graph must be delivered by this pack; may be "
+        "given multiple times",
+    )
     p_import.add_argument("packfile", help="path to the .pack file")
     p_import.add_argument(
         "--no-publish",

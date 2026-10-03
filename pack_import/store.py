@@ -127,6 +127,20 @@ class ObjectStore:
     def loose_path(self, oid: str) -> Path:
         return self.objects_dir / oid[:2] / oid[2:]
 
+    def published_oids(self) -> set:
+        """Return the object ids that belong to *committed* imports.
+
+        The manifest -- not the loose-object directory -- defines archive
+        membership: a loose file left behind by a crash between moving
+        objects and replacing the manifest is an unreferenced leftover,
+        never previously archived content.
+        """
+        oids: set = set()
+        for record in self.read_manifest().get("imports", []):
+            for obj in record.get("objects", []):
+                oids.add(obj["oid"])
+        return oids
+
     # -- BaseProvider interface ----------------------------------------------
 
     def has(self, oid: str) -> bool:
@@ -201,9 +215,26 @@ class ObjectStore:
             raise ValueError("staged import has no manifest record")
         with open(self._lock_path, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            self._check_object_collisions(staged)
             self._move_objects(staged)
             self._publish_manifest(staged.record)
         shutil.rmtree(staged.directory, ignore_errors=True)
+
+    def _check_object_collisions(self, staged: StagedImport) -> None:
+        """Pre-flight: every existing destination must be byte-identical.
+
+        Checking all destinations before any move means a content collision
+        rejects the batch while the previously published object set is
+        exactly as it was -- no staged object has entered ``objects/``.
+        """
+        for obj in staged.objects:
+            dst = self.objects_dir / obj["path"]
+            if dst.exists():
+                src = staged.directory / "objects" / obj["path"]
+                if dst.read_bytes() != src.read_bytes():
+                    raise PackFormatError(
+                        f"object {obj['oid']} already exists with different content"
+                    )
 
     def _move_objects(self, staged: StagedImport) -> None:
         synced = set()

@@ -2,6 +2,7 @@
 
 from .errors import (
     ChecksumError,
+    ConnectivityError,
     DeltaChainCycleError,
     DeltaChainError,
     DeltaChainTooDeepError,
@@ -37,6 +38,7 @@ __all__ = [
     "MAX_OBJECT_SIZE",
     "MAX_DELTA_DEPTH",
     "PackImportError",
+    "ConnectivityError",
     "LimitExceededError",
     "ObjectTooLargeError",
     "PackFormatError",

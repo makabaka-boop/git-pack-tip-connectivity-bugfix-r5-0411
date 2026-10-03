@@ -30,7 +30,32 @@
 - `OFS_DELTA` 偏移必须非零、向后、且指向此前某个对象的起始处；
 - 差量程序逐条指令校验：拷贝区间不得越出基对象、字面插入不得越出程序、
   指令 0 拒绝、产出必须恰好等于声明的目标长度；
-- 缺失基对象、依赖环、单对象重建超 1 MB → 拒绝整批。
+- 缺失基对象、依赖环、单对象重建超 1 MB → 拒绝整批；
+- 指定 `--tip` 时额外做**提交图连通性与对象种类校验**（见下）。
+
+## 提交图交付（`--tip`）
+
+带 `--tip`（可重复）的导入代表*完整提交图交付*：仅当从 tip 可达的全部
+提交、树、文件内容（blob）与带注释标签都在**本包或已提交清单**中、且
+每个引用的对象种类与用途一致时，导入才能成功。
+
+- tip 可以是 `commit`，或最终剥到 commit 的 annotated tag（支持 tag 套
+  tag；带环、过深、类型谎报一律拒绝）；
+- commit 的 `tree` 必须是 tree 对象，每个 `parent` 必须是 commit；
+- 树项模式决定被引用对象的种类：`100644/100664/100755` 与符号链接
+  `120000` 都必须指向 blob（符号链接的目标路径就是 blob 文本），
+  `040000` 指向 tree，`160000`（gitlink）是**外部子模块**引用，不要求
+  其对象在本地；
+- 树项名按原始字节解析，二进制名与含空格的名字合法；
+- 本包与此前成功导入共享的对象无需重发；**只有出现在已发布
+  `manifest.json` 中的对象才算归档内容**——崩溃窗口遗留的未引用松散
+  对象即使物理存在也不会被当作已有内容（清单里有、磁盘上却缺失或损坏
+  的对象同样判失败）。
+
+校验在解析/差量重建之后、写入隔离区**之前**完成，因此连通性失败不会
+暂存或发布任何对象，也不会向清单追加记录。未指定 `--tip` 时维持原有
+的对象级导入语义（不做后代检查）。
+
 
 ## 暂存与原子发布协议
 
@@ -54,10 +79,11 @@
 ## 用法
 
 ```bash
-python3 -m pack_import --store STORE import file.pack   # 校验+暂存+原子发布
-python3 -m pack_import --store STORE import --no-publish file.pack  # 只暂存
-python3 -m pack_import --store STORE manifest           # 查看已发布清单
-python3 -m pack_import --store STORE cleanup            # 清理中断的暂存
+python3 -m pack_import --store STORE import file.pack                 # 校验+暂存+原子发布
+python3 -m pack_import --store STORE import --tip <oid> file.pack     # 完整提交图交付
+python3 -m pack_import --store STORE import --no-publish file.pack    # 只暂存
+python3 -m pack_import --store STORE manifest                         # 查看已发布清单
+python3 -m pack_import --store STORE cleanup                          # 清理中断的暂存
 ```
 
 Python API：
@@ -66,11 +92,12 @@ Python API：
 from pack_import import ObjectStore, PackImporter
 
 store = ObjectStore("STORE")
-record = PackImporter(store).import_pack("file.pack")   # 一步完成
+record = PackImporter(store).import_pack("file.pack")                 # 一步完成
+record = PackImporter(store).import_pack("file.pack", tips=[tip])     # 提交图交付
 
-staged = PackImporter(store).stage_pack("file.pack")    # 两阶段：先暂存
-store.publish(staged)                                   # 提交
-# 或 store.abort(staged)                                # 取消
+staged = PackImporter(store).stage_pack("file.pack")                  # 两阶段：先暂存
+store.publish(staged)                                                 # 提交
+# 或 store.abort(staged)                                              # 取消
 ```
 
 ## 测试
@@ -86,6 +113,7 @@ python3 -m pytest
 - `tests/test_packfile.py`：手工构造的篡改校验和、截断 zlib、声明长度
   不符、越界拷贝、指令 0、超深差量链、缺失基、依赖环、超限等攻击向量；
 - `tests/test_store.py`：隔离、取消、发布前后崩溃与清理的语义；
+- `tests/test_connectivity.py`：`--tip` 提交图连通性（缺后代、种类不符、
+  带注释标签、合并提交、二进制名、符号链接、gitlink、共享对象与遗留
+  松散对象）；
 - `tests/test_cli.py`：命令行冒烟。
-
-带 --tip 的导入代表完整提交图交付：tip 可为 commit 或指向 commit 的 annotated tag，需要验证可达提交、树与文件内容均存在且类型匹配。gitlink 是外部仓库引用，不要求本库含其对象。失败时导入记录和公开对象集合保持原状。未指定 tip 时继续支持原有对象级导入。
