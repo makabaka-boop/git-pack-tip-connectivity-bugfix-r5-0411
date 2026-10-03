@@ -22,11 +22,12 @@ from .packfile import (
     compute_oid,
     parse_pack,
 )
-from .store import ObjectStore, StagedImport
+from .store import ObjectStore, PublishedStoreView, StagedImport
 
 __all__ = [
     "PackImporter",
     "ObjectStore",
+    "PublishedStoreView",
     "StagedImport",
     "parse_pack",
     "apply_delta_program",

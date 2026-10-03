@@ -105,6 +105,33 @@ def test_crash_during_publish_keeps_old_manifest(store, importer, monkeypatch):
     assert len(store.read_manifest()["imports"]) == 2
 
 
+def test_crash_during_publish_rolls_moved_objects_back(store, importer, monkeypatch):
+    """After a pre-commit-point failure, no moved object remains published."""
+    importer.import_pack(_sample_pack())
+    before = store.read_manifest()
+    gamma = blob_oid(b"gamma")
+
+    staged = importer.stage_pack(_second_pack())
+    real_replace = os.replace
+
+    def bomb(src, dst):
+        if os.fspath(dst).endswith("manifest.json"):
+            raise OSError("simulated crash at commit point")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", bomb)
+    with pytest.raises(OSError, match="simulated crash"):
+        store.publish(staged)
+    monkeypatch.undo()
+
+    # the moved object is back in quarantine and absent from objects/
+    assert not store.has(gamma)
+    assert (staged.directory / "objects" / gamma[:2] / gamma[2:]).exists()
+    assert store.read_manifest() == before
+    store.abort(staged)
+    assert not store.has(gamma)
+
+
 def test_failed_import_stages_nothing(store, importer):
     bad = bytearray(_sample_pack())
     bad[-1] ^= 0x01
@@ -144,6 +171,26 @@ def test_staged_loose_object_format(store, importer):
     oid = blob_oid(b"alpha")
     raw = zlib.decompress(store.loose_path(oid).read_bytes())
     assert raw == b"blob 5\0alpha"
+
+
+def test_published_oids_excludes_orphans(store, importer):
+    importer.import_pack(_sample_pack())
+    alpha = blob_oid(b"alpha")
+    orphan = blob_oid(b"orphan")
+    from pack_import.store import loose_object_bytes
+
+    p = store.loose_path(orphan)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(loose_object_bytes("blob", b"orphan"))
+
+    assert alpha in store.published_oids()
+    assert orphan not in store.published_oids()
+    assert store.has(orphan)  # present on disk ...
+    view = __import__("pack_import").PublishedStoreView(
+        store, store.published_oids()
+    )
+    assert not view.has(orphan)  # ... but invisible as archived content
+    assert view.has(alpha)
 
 
 def test_staged_objects_not_visible_to_base_provider(store, importer):

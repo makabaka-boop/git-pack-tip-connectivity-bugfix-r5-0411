@@ -9,7 +9,7 @@ from typing import Dict, Optional, Union
 from .connectivity import verify_tips
 from .errors import LimitExceededError
 from .packfile import MAX_PACK_SIZE, DeltaResolver, parse_pack
-from .store import ObjectStore, StagedImport
+from .store import ObjectStore, PublishedStoreView, StagedImport
 
 PackSource = Union[str, os.PathLike, bytes, bytearray, memoryview]
 
@@ -40,24 +40,47 @@ class PackImporter:
     def stage_pack(self, source: PackSource, *, tips=()) -> StagedImport:
         """Fully parse and verify *source*, then quarantine its objects.
 
-        Nothing is published by this method.  Any verification failure
-        raises before a single byte is staged; any staging failure cleans
-        up the quarantine directory.
+        Nothing is published by this method.  Parsing, delta reconstruction,
+        id checks and tip reachability all complete before a single byte is
+        staged; any failure aborts the import without touching the object
+        store or the manifest.  The pre-existing archive is viewed through a
+        snapshot of the manifest, so loose objects orphaned by an earlier
+        interrupted publish can never be mistaken for committed content.
         """
         data = _read_source(source)
         parsed = parse_pack(data)
-        resolver = DeltaResolver(parsed.entries, base_provider=self.store)
+
+        # Snapshot committed content: only manifest-listed objects may serve
+        # as thin-pack bases or satisfy tip references.
+        published = PublishedStoreView(self.store, self.store.published_oids())
+
+        resolver = DeltaResolver(parsed.entries, base_provider=published)
         resolver.resolve_all()  # reconstructs + verifies every object
 
-        verified_tips = verify_tips(
-            tips, {e.oid: (e.type_name, e.content) for e in parsed.entries}, self.store
-        )
+        incoming = {}
+        for entry in parsed.entries:
+            assert entry.oid is not None and entry.content is not None
+            incoming[entry.oid] = (entry.type_name, entry.content)
+        verified_tips = verify_tips(tips, incoming, published)
+
         staged = self.store.begin_import()
         try:
+            seen = set()
+            staged_objects = []
             for entry in parsed.entries:
                 assert entry.oid is not None and entry.content is not None
+                if entry.oid in seen:
+                    continue  # same object appearing twice in one pack
+                seen.add(entry.oid)
                 self.store.stage_object(
                     staged, entry.oid, entry.type_name, entry.content
+                )
+                staged_objects.append(
+                    {
+                        "oid": entry.oid,
+                        "type": entry.type_name,
+                        "size": len(entry.content),
+                    }
                 )
             staged.record = {
                 "id": staged.token,
@@ -65,11 +88,8 @@ class PackImporter:
                 "imported_at": datetime.now(timezone.utc).isoformat(),
                 "pack_id": parsed.pack_id,
                 "pack_size": len(data),
-                "object_count": len(parsed.entries),
-                "objects": [
-                    {"oid": e.oid, "type": e.type_name, "size": len(e.content)}
-                    for e in parsed.entries
-                ],
+                "object_count": len(staged_objects),
+                "objects": staged_objects,
             }
         except BaseException:
             self.store.abort(staged)
@@ -82,9 +102,8 @@ class PackImporter:
         try:
             self.store.publish(staged)
         except BaseException:
-            # Publish may have moved some objects already (harmless: they are
-            # content-addressed and unreferenced without the manifest), but
-            # the manifest was not replaced -- clean up the quarantine area.
+            # publish() rolls objects moved before the commit point back into
+            # the quarantine directory; drop that directory on the way out.
             self.store.abort(staged)
             raise
         return staged.record

@@ -50,6 +50,29 @@ MANIFEST_NAME = "manifest.json"
 MANIFEST_VERSION = 1
 
 
+class PublishedStoreView:
+    """BaseProvider/connectivity view exposing only committed objects.
+
+    Wraps an :class:`ObjectStore` together with a snapshot of the manifest
+    taken before an import started.  ``has`` is true only for objects that
+    are both on disk and listed in a committed import record, so loose
+    objects left behind by an interrupted publish can never be accepted as
+    pre-existing archive content or as thin-pack delta bases.
+    """
+
+    def __init__(self, store: "ObjectStore", oids: set):
+        self._store = store
+        self._oids = oids
+
+    def has(self, oid: str) -> bool:
+        return oid in self._oids and self._store.loose_path(oid).is_file()
+
+    def read(self, oid: str) -> Tuple[str, bytes]:
+        if not self.has(oid):
+            raise MissingBaseError(f"object {oid} not in published archive")
+        return self._store.read(oid)
+
+
 def _fsync_dir(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -127,6 +150,21 @@ class ObjectStore:
     def loose_path(self, oid: str) -> Path:
         return self.objects_dir / oid[:2] / oid[2:]
 
+    def published_oids(self) -> set:
+        """Object ids that belong to *committed* imports.
+
+        Only objects listed in the manifest count as published.  Loose
+        objects orphaned by a publish that crashed before the commit point
+        exist on disk but are deliberately absent here, so they can never
+        satisfy a tip reachability check or a thin-pack delta base.
+        """
+        manifest = self.read_manifest()
+        oids = set()
+        for record in manifest.get("imports", []):
+            for obj in record.get("objects", []):
+                oids.add(obj["oid"])
+        return oids
+
     # -- BaseProvider interface ----------------------------------------------
 
     def has(self, oid: str) -> bool:
@@ -194,22 +232,45 @@ class ObjectStore:
         """Atomically publish a fully staged import.
 
         Objects are moved into place first; the manifest replacement is the
-        atomic commit point.  On any failure the previously published
-        manifest remains valid.
+        atomic commit point.  A failure *before* the commit point rolls the
+        moved objects back into the quarantine directory, so a rejected
+        import neither publishes objects nor appends to the manifest: the
+        previously published store is unchanged.  A hard process crash in
+        the move window may still leave unreferenced loose objects (exactly
+        like interrupted git object writes); such orphans are not listed in
+        the manifest and are ignored as archived content on retry.
         """
         if staged.record is None:
             raise ValueError("staged import has no manifest record")
         with open(self._lock_path, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            self._move_objects(staged)
-            self._publish_manifest(staged.record)
+            moved = []
+            try:
+                moved = self._move_objects(staged)
+                self._publish_manifest(staged.record)
+            except BaseException:
+                self._rollback_objects(staged, moved)
+                raise
         shutil.rmtree(staged.directory, ignore_errors=True)
 
-    def _move_objects(self, staged: StagedImport) -> None:
+    def _move_objects(self, staged: StagedImport) -> List[str]:
+        """Move staged objects into ``objects/``; return moved relative paths.
+
+        Paths of objects that already existed (identical, content-addressed)
+        are not returned, since there is nothing to roll back for them.
+        """
+        moved: List[str] = []
         synced = set()
         for obj in staged.objects:
             src = staged.directory / "objects" / obj["path"]
             dst = self.objects_dir / obj["path"]
+            if not src.exists():
+                # Moved in an earlier attempt of the same staged import.
+                if dst.exists():
+                    continue
+                raise PackFormatError(
+                    f"staged object {obj['oid']} vanished before publish"
+                )
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
                 # Content-addressed store: an existing object must be
@@ -221,10 +282,28 @@ class ObjectStore:
                 src.unlink()
             else:
                 os.replace(src, dst)  # atomic, same filesystem
+                moved.append(obj["path"])
             if dst.parent not in synced:
                 _fsync_dir(dst.parent)
                 synced.add(dst.parent)
         _fsync_dir(self.objects_dir)
+        return moved
+
+    def _rollback_objects(self, staged: StagedImport, moved: List[str]) -> None:
+        """Return objects moved during a failed publish to the staging area."""
+        for rel in reversed(moved):
+            dst = self.objects_dir / rel
+            src = staged.directory / "objects" / rel
+            if not dst.exists():
+                continue
+            try:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(dst, src)
+            except OSError:
+                # Best effort: the object is content-addressed and, without a
+                # manifest entry, remains an invisible orphan; quarantine
+                # cleanup can still discard the staging directory.
+                pass
 
     def _publish_manifest(self, record: Dict) -> None:
         manifest = self.read_manifest()

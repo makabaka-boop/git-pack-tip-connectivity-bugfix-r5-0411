@@ -82,3 +82,67 @@ def test_cli_import_git_pack(tmp_path, src_repo):
     r = run_cli("--store", str(store), "import", str(pack_file))
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["object_count"] == len(oids)
+
+
+def _commit_pack(tmp_path):
+    """A minimal valid commit graph pack, via raw object construction."""
+    from pack_import.packfile import OBJ_BLOB, OBJ_COMMIT, OBJ_TREE, compute_oid
+
+    blob = b"cli tip\n"
+    b_oid = compute_oid("blob", blob)
+    tree = b"100644 f\0" + bytes.fromhex(b_oid)
+    t_oid = compute_oid("tree", tree)
+    commit = (
+        f"tree {t_oid}\n"
+        "author A <a@b.c> 1 +0000\n"
+        "committer A <a@b.c> 1 +0000\n\n"
+        "m\n"
+    ).encode()
+    c_oid = compute_oid("commit", commit)
+
+    b = PackBuilder()
+    b.add(OBJ_COMMIT, commit)
+    b.add(OBJ_TREE, tree)
+    b.add(OBJ_BLOB, blob)
+    pack_file = tmp_path / "commit.pack"
+    pack_file.write_bytes(b.build())
+    return pack_file, c_oid, b_oid
+
+
+def test_cli_import_with_tip_records_it(tmp_path):
+    store = tmp_path / "store"
+    pack_file, c_oid, _ = _commit_pack(tmp_path)
+
+    r = run_cli("--store", str(store), "import", "--tip", c_oid, str(pack_file))
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["tips"] == [c_oid]
+    assert json.loads(run_cli("--store", str(store), "manifest").stdout)["imports"]
+
+
+def test_cli_tip_missing_descendant_publishes_nothing(tmp_path):
+    from pack_import.packfile import OBJ_COMMIT, OBJ_TREE, compute_oid
+
+    store = tmp_path / "store"
+    # commit+tree reference a blob that is not carried in the pack
+    ghost = "a" * 40
+    tree = b"100644 f\0" + bytes.fromhex(ghost)
+    t_oid = compute_oid("tree", tree)
+    commit = (
+        f"tree {t_oid}\n"
+        "author A <a@b.c> 1 +0000\n"
+        "committer A <a@b.c> 1 +0000\n\n"
+        "m\n"
+    ).encode()
+    c_oid = compute_oid("commit", commit)
+
+    b = PackBuilder()
+    b.add(OBJ_COMMIT, commit)
+    b.add(OBJ_TREE, tree)
+    pack_file = tmp_path / "bad-tip.pack"
+    pack_file.write_bytes(b.build())
+
+    r = run_cli("--store", str(store), "import", "--tip", c_oid, str(pack_file))
+    assert r.returncode == 1
+    assert "missing" in r.stderr
+    assert json.loads(run_cli("--store", str(store), "manifest").stdout)["imports"] == []
+    assert list((store / "objects").rglob("*")) == []
